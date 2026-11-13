@@ -23,12 +23,15 @@ RETRY_CONFIDENCE = 0.90
 
 
 @njit(cache=True)
-def advance(dets, layers, ptr, vals, probs, scratch, indices, weights, touched, hist, relcut, cap):
-    n = 1
-    indices[0] = 0
-    weights[0] = 1.
+def advance(
+    dets, layers, ptr, vals, probs, scratch, indices, weights, touched, hist, relcut, cap,
+    start_layer=0, n=1,
+):
+    if start_layer == 0:
+        indices[0] = 0
+        weights[0] = 1.0
     # Track unsigned mass and four signed observable masses for each boundary syndrome.
-    for layer in range(layers):
+    for layer in range(start_layer, layers):
         m = 0
         best = 0.
         edges = ptr[layer]
@@ -134,7 +137,10 @@ def join(left, wl, order_left, right, wr, order_right, observed, local, cutoff_r
 
 
 @njit(parallel=True)
-def cache_messages(segments, ptr0, ptr1, ptr2, val0, val1, val2, q0, q1, q2, relcut, cap):
+def cache_messages(
+    segments, ptr0, ptr1, ptr2, val0, val1, val2, q0, q1, q2,
+    relcut, cap, sort_output, prefix_index, prefix_states, prefix_weights, prefix_counts,
+):
     n_segments, layers = segments.shape
     capacity = min(2 * cap, 4096)
     states = np.empty((n_segments, capacity), dtype=np.int64)
@@ -148,33 +154,53 @@ def cache_messages(segments, ptr0, ptr1, ptr2, val0, val1, val2, q0, q1, q2, rel
         values = np.empty((16384, 5))
         hist = np.empty(64, np.int64)
         for i in range(worker, n_segments, n_threads):
+            begin, n = restore_prefix(
+                prefix_index[i], prefix_states, prefix_weights, prefix_counts, indices, values,
+            )
             n = advance(
                 segments[i], layers, (ptr0, ptr1, ptr2), (val0, val1, val2), (q0, q1, q2),
-                scratch, indices, values, touched, hist, relcut, cap,
+                scratch, indices, values, touched, hist, relcut, cap, begin, n,
             )
-            if n <= capacity:
-                counts[i] = n
+            if n > capacity:
+                counts[i] = -1
+                continue
+            counts[i] = n
+            if sort_output:
                 order = np.argsort(-values[:n, 0])
                 for j in range(n):
-                    state = order[j]
-                    states[i, j] = indices[state]
-                    weights[i, j] = values[state]
+                    states[i, j] = indices[order[j]]
+                    weights[i, j] = values[order[j]]
             else:
-                counts[i] = -1
+                states[i, :n] = indices[:n]
+                weights[i, :n] = values[:n]
     return states, weights, counts
+
+
+@njit(cache=True)
+def restore_prefix(cached_index, states, weights, counts, output_states, output_weights):
+    if cached_index < 0 or counts[cached_index] < 0:
+        return 0, 1
+    n = counts[cached_index]
+    output_states[:n] = states[cached_index, :n]
+    output_weights[:n] = weights[cached_index, :n]
+    return 2, n
 
 
 @njit(cache=True)
 def message(
     dets, cached_index, cached_states, cached_weights, cached_counts, ordered,
     layers, pointers, columns, probabilities, scratch, states, weights, touched, hist, relcut, cap,
+    prefix_index, prefix_states, prefix_weights, prefix_counts,
 ):
     if cached_index >= 0 and cached_counts[cached_index] >= 0:
         n = cached_counts[cached_index]
         return cached_states[cached_index], cached_weights[cached_index], ordered[:n]
+    begin, n = restore_prefix(
+        prefix_index, prefix_states, prefix_weights, prefix_counts, states, weights,
+    )
     n = advance(
         dets, layers, pointers, columns, probabilities,
-        scratch, states, weights, touched, hist, relcut, cap,
+        scratch, states, weights, touched, hist, relcut, cap, begin, n,
     )
     return states, weights, np.argsort(-weights[:n, 0])
 
@@ -183,6 +209,7 @@ def message(
 def decode_margins(
     dets, left_index, right_index, left_states, left_weights, left_counts,
     right_states, right_weights, right_counts,
+    prefix_index, prefix_states, prefix_weights, prefix_counts,
     lp0, lp1, lp2, lv0, lv1, lv2, lq0, lq1, lq2,
     rp0, rp1, rv0, rv1, rq0, rq1, local, relcut, cap,
 ):
@@ -207,11 +234,13 @@ def decode_margins(
                     dk, left_index[i], left_states, left_weights, left_counts, ordered, 3,
                     (lp0, lp1, lp2), (lv0, lv1, lv2), (lq0, lq1, lq2),
                     scratch, li, lw, touched, hist, relcut, cap,
+                    prefix_index[i], prefix_states, prefix_weights, prefix_counts,
                 )
                 right, right_mass, right_order = message(
                     dk[::-1], right_index[i], right_states, right_weights, right_counts, ordered, 2,
                     (rp0, rp1), (rv0, rv1), (rq0, rq1),
                     scratch, ri, rw, touched, hist, relcut, cap,
+                    -1, prefix_states, prefix_weights, prefix_counts,
                 )
                 totals = join(
                     left, left_mass, left_order, right, right_mass, right_order,
@@ -224,11 +253,13 @@ def decode_margins(
     return out, confidence
 
 
-def shared_messages(segments, transitions, relcut, cap):
-    unique, inverse, counts = np.unique(segments, axis=0, return_inverse=True, return_counts=True)
-    repeated = counts >= 3
+def grouping(segments, minimum):
+    unique, first, inverse, counts = np.unique(
+        segments, axis=0, return_index=True, return_inverse=True, return_counts=True,
+    )
+    repeated = counts >= minimum
     group = np.where(repeated, np.cumsum(repeated) - 1, -1)
-    return group[inverse], cache_messages(unique[repeated], *transitions, relcut, cap)
+    return unique[repeated], first[repeated], group[inverse]
 
 
 def pass_margins(dets, tables, relcut, cap):
@@ -236,10 +267,26 @@ def pass_margins(dets, tables, relcut, cap):
     left, right = transitions[:9], transitions[9:]
     # The cache accepts three arrays of each kind. Two layers use the first two.
     right_padded = [right[j] for j in (0, 1, 1, 2, 3, 3, 4, 5, 5)]
-    li, left_cache = shared_messages(dets[:, :3], left, relcut, cap)
-    ri, right_cache = shared_messages(dets[:, 5:3:-1], right_padded, relcut, cap)
+    empty = np.empty((0, 0), dtype=np.int64), np.empty((0, 0, 5)), np.empty(0, dtype=np.int64)
+
+    # Reuse the first two rounds even when the third observed round differs.
+    prefixes, _, prefix_index = grouping(dets[:, :2], 4)
+    prefix_cache = cache_messages(
+        prefixes, *left, relcut, cap, False, np.full(len(prefixes), -1, dtype=np.int64), *empty,
+    )
+
+    left_segments, left_first, li = grouping(dets[:, :3], 3)
+    left_cache = cache_messages(
+        left_segments, *left, relcut, cap, True, prefix_index[left_first], *prefix_cache,
+    )
+    right_segments, _, ri = grouping(dets[:, 5:3:-1], 3)
+    right_cache = cache_messages(
+        right_segments, *right_padded, relcut, cap, True,
+        np.full(len(right_segments), -1, dtype=np.int64), *empty,
+    )
     return decode_margins(
-        dets, li, ri, *left_cache, *right_cache, *transitions, tables.middle, relcut, cap,
+        dets, li, ri, *left_cache, *right_cache, prefix_index, *prefix_cache,
+        *transitions, tables.middle, relcut, cap,
     )
 
 
