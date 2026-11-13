@@ -32,13 +32,16 @@ def main():
     import stim
     from csv_io import load_kaggle_csv, save_submission
 
+    try:
+        data = load_kaggle_csv(args.input)
+    except ValueError as error:
+        parser.error(str(error))
+    if not np.isin(data["basis"], ("X", "Z")).all():
+        parser.error("input CSV must use X or Z as the basis")
+
     directory = ROOT if args.variant == "v3-fast" else ROOT / "variants" / args.variant
     sys.path.insert(0, str(directory))
     from decoder import decode
-
-    data = load_kaggle_csv(args.input)
-    if not np.isin(data["basis"], ("X", "Z")).all():
-        parser.error("input CSV must use X or Z as the basis")
 
     experiments = []
     for basis in ("X", "Z"):

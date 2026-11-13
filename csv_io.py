@@ -16,14 +16,17 @@ def load_kaggle_csv(path):
     with open(path) as f:
         header = f.readline().strip().split(",")
     detector_columns = [i for i, name in enumerate(header) if name.startswith("D")]
-    observable_columns = [header.index(name) for name in OBSERVABLE_COLUMNS if name in header]
+    label_counts = [header.count(name) for name in OBSERVABLE_COLUMNS]
+    if any(label_counts) and label_counts != [1] * len(OBSERVABLE_COLUMNS):
+        raise ValueError("CSV must contain each observable label L0 through L3 exactly once, or omit all four")
     text = np.loadtxt(path, delimiter=",", skiprows=1, usecols=(header.index("id"), header.index("basis")), dtype=str, ndmin=2)
     data = {
         "id": text[:, 0],
         "basis": text[:, 1],
         "detector_events": np.loadtxt(path, delimiter=",", skiprows=1, usecols=detector_columns, dtype=np.uint8, ndmin=2).astype(bool),
     }
-    if observable_columns:
+    if any(label_counts):
+        observable_columns = [header.index(name) for name in OBSERVABLE_COLUMNS]
         data["observable_flips"] = np.loadtxt(path, delimiter=",", skiprows=1, usecols=observable_columns, dtype=np.uint8, ndmin=2).astype(bool)
     return data
 
